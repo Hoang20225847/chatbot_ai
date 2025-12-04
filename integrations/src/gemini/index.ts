@@ -76,3 +76,5 @@ export class GeminiClient implements GenAIClient {
     }
   }
 }
+export * from './embeddings.service';
+export * from './chat.service';

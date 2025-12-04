@@ -10,12 +10,19 @@
     "dev:client": "webpack serve --config client/webpack.js",
     "build:client": "webpack --config client/webpack.js",
     "dev:server": "webpack --config server/webpack.js --watch",
-    "build:server": "webpack --config server/webpack.js"
+    "build:server": "webpack --config server/webpack.js",
+    "ingest": "ts-node scripts/ingest-audit-findings.ts",
+    "ingest:test": "npm run ingest -- test",
+    "ingest:stats": "npm run ingest -- stats",
+    "ingest:folder": "npm run ingest -- ingest ./datatest",
+    
+    "// Existing scripts...": ""
   },
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "connect-redis": "^8.0.0",
     "express": "^4.21.1",
     "express-session": "^1.18.1",

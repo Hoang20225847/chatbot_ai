@@ -1,6 +1,6 @@
 // rag/src/pipeline/rag-pipeline.ts
 import { VectorSearchService, SearchOptions, SearchResult } from '../retrieval/vector-search';
-import { OpenAIChatService } from '../../../integrations/src/openai/chat.service';
+import { GeminiChatService } from '../../../integrations/src/gemini';
 
 export interface RAGRequest {
   query: string;
@@ -22,7 +22,7 @@ export interface RAGResponse {
 export class RAGPipeline {
   constructor(
     private vectorSearch: VectorSearchService,
-    private chatService: OpenAIChatService
+    private chatService: GeminiChatService
   ) {}
 
   /**
@@ -42,7 +42,7 @@ export class RAGPipeline {
     // 2. CONTEXT BUILDING: Build context từ retrieved chunks
     const context = this.buildContext(searchResults);
 
-    // 3. GENERATION: Generate answer với LLM
+    // 3. GENERATION: Generate answer với Gemini
     const generationStart = Date.now();
     const answer = await this.generateAnswer(
       request.query,
@@ -64,11 +64,51 @@ export class RAGPipeline {
   }
 
   /**
+   * Stream RAG response
+   */
+  async *queryStream(request: RAGRequest): AsyncGenerator<{
+    type: 'sources' | 'chunk' | 'done';
+    data?: any;
+  }> {
+    // 1. RETRIEVAL
+    const searchResults = await this.vectorSearch.hybridSearch(
+      request.query,
+      request.searchOptions
+    );
+
+    // Yield sources first
+    yield {
+      type: 'sources',
+      data: searchResults
+    };
+
+    // 2. BUILD CONTEXT
+    const context = this.buildContext(searchResults);
+
+    // 3. STREAM GENERATION
+    const messages = this.prepareMessages(
+      request.query,
+      context,
+      request.conversationHistory,
+      request.systemPrompt
+    );
+
+    for await (const chunk of this.chatService.streamChat(messages)) {
+      yield {
+        type: 'chunk',
+        data: chunk
+      };
+    }
+
+    yield { type: 'done' };
+  }
+
+  /**
    * Build context string từ search results
    */
   private buildContext(results: SearchResult[]): string {
     if (results.length === 0) {
-      return 'No relevant security audit findings found.';
+      return 'No relevant security audit findings found in the database.';
     }
 
     const contextParts = results.map((result, idx) => {
@@ -77,8 +117,9 @@ export class RAGPipeline {
         `Protocol: ${result.metadata.protocol}`,
         `Issue: ${result.metadata.title}`,
         `Impact: ${result.metadata.impact}`,
+        `Audit Firm: ${result.metadata.firm}`,
         `Relevance Score: ${result.score.toFixed(3)}`,
-        `\n${result.text}`,
+        `\nContent:\n${result.text}`,
         `\nReference: ${result.metadata.source_link}`,
         `---`
       ].join('\n');
@@ -88,7 +129,32 @@ export class RAGPipeline {
   }
 
   /**
-   * Generate answer using LLM with retrieved context
+   * Prepare messages for chat
+   */
+  private prepareMessages(
+    query: string,
+    context: string,
+    conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>,
+    customSystemPrompt?: string
+  ): Array<{ role: 'user' | 'assistant'; content: string }> {
+    const systemPrompt = customSystemPrompt || this.getDefaultSystemPrompt();
+    const userMessage = this.buildUserMessage(query, context, systemPrompt);
+
+    const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+    // Add conversation history if provided
+    if (conversationHistory && conversationHistory.length > 0) {
+      messages.push(...conversationHistory);
+    }
+
+    // Add current query with context
+    messages.push({ role: 'user', content: userMessage });
+
+    return messages;
+  }
+
+  /**
+   * Generate answer using Gemini with retrieved context
    */
   private async generateAnswer(
     query: string,
@@ -96,25 +162,11 @@ export class RAGPipeline {
     conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>,
     customSystemPrompt?: string
   ): Promise<string> {
-    const systemPrompt = customSystemPrompt || this.getDefaultSystemPrompt();
+    const messages = this.prepareMessages(query, context, conversationHistory, customSystemPrompt);
 
-    const messages: Array<{ role: string; content: string }> = [
-      { role: 'system', content: systemPrompt }
-    ];
-
-    // Add conversation history nếu có
-    if (conversationHistory && conversationHistory.length > 0) {
-      messages.push(...conversationHistory);
-    }
-
-    // Add current query với context
-    const userMessage = this.buildUserMessage(query, context);
-    messages.push({ role: 'user', content: userMessage });
-
-    // Call LLM
     const response = await this.chatService.chat(messages, {
       temperature: 0.3, // Lower temperature cho factual responses
-      maxTokens: 1000
+      maxTokens: 2048
     });
 
     return response;
@@ -126,33 +178,34 @@ export class RAGPipeline {
   private getDefaultSystemPrompt(): string {
     return `You are a specialized assistant for smart contract security audits and blockchain security.
 
-Your role is to help developers understand security vulnerabilities, audit findings, and best practices based on real audit reports.
+Your role is to help developers understand security vulnerabilities, audit findings, and best practices based on real audit reports from the database.
 
 Guidelines:
-1. Answer questions using the provided audit findings as context
-2. Always cite sources by mentioning the protocol name and audit firm
-3. If the context doesn't contain relevant information, clearly state that
+1. Answer questions using ONLY the provided audit findings as context
+2. Always cite sources by mentioning the protocol name, audit firm, and impact level
+3. If the context doesn't contain relevant information, clearly state "I don't have information about this in the audit database"
 4. Provide actionable recommendations when discussing vulnerabilities
-5. Use technical terminology appropriately but explain complex concepts
-6. Highlight the severity (impact level) of issues when relevant
+5. Use technical terminology appropriately but explain complex concepts clearly
+6. Highlight the severity (impact level: LOW/MEDIUM/HIGH/CRITICAL) of issues
 7. If multiple findings are related, synthesize them into a coherent answer
+8. When discussing vulnerabilities, mention both the issue and the recommendation if available
 
-When a question is outside the scope of the provided audit findings, acknowledge this limitation and suggest what information would be needed.`;
+Important: Do NOT make up information. Only use what's provided in the audit findings context.`;
   }
 
   /**
    * Build user message với context
    */
-  private buildUserMessage(query: string, context: string): string {
-    return `Based on the following smart contract security audit findings, please answer the question.
+  private buildUserMessage(query: string, context: string, systemPrompt: string): string {
+    return `${systemPrompt}
 
 AUDIT FINDINGS CONTEXT:
 ${context}
 
-QUESTION:
+USER QUESTION:
 ${query}
 
-Please provide a comprehensive answer based on the audit findings above. If the findings don't fully address the question, mention what additional information might be needed.`;
+Please provide a comprehensive answer based strictly on the audit findings above. If the findings don't address the question, clearly state what information is missing.`;
   }
 
   /**
@@ -194,7 +247,7 @@ Please provide a comprehensive answer based on the audit findings above. If the 
     protocols: string[],
     aspect: string
   ): Promise<RAGResponse> {
-    const query = `Compare ${aspect} across ${protocols.join(', ')} protocols`;
+    const query = `Compare ${aspect} across ${protocols.join(', ')} protocols based on their security audit findings`;
     
     return this.query({
       query,
@@ -206,16 +259,33 @@ Please provide a comprehensive answer based on the audit findings above. If the 
     });
   }
 
+  /**
+   * Get vulnerability patterns
+   */
+  async getVulnerabilityPatterns(
+    vulnerabilityType: string
+  ): Promise<RAGResponse> {
+    const query = `What are common patterns and examples of ${vulnerabilityType} vulnerabilities in smart contracts?`;
+    
+    return this.query({
+      query,
+      searchOptions: {
+        topK: 8
+      }
+    });
+  }
+
   private getComparativeSystemPrompt(): string {
-    return `You are analyzing and comparing security findings across multiple protocols.
+    return `You are analyzing and comparing security findings across multiple protocols based on real audit reports.
 
 Provide a structured comparison that:
-1. Identifies common vulnerabilities or patterns
+1. Identifies common vulnerabilities or patterns across protocols
 2. Highlights unique issues for each protocol
 3. Compares severity and impact levels
-4. Summarizes key differences in security posture
-5. Provides comparative recommendations
+4. Notes which audit firms conducted the audits
+5. Summarizes key differences in security posture
+6. Provides comparative recommendations
 
-Present your analysis in a clear, organized format.`;
+Present your analysis in a clear, organized format with proper citations.`;
   }
 }

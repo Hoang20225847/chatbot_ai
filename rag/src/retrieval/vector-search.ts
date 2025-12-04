@@ -1,6 +1,6 @@
 // rag/src/retrieval/vector-search.ts
 import { AuditFinding } from '../../../data/src/models/audit-finding.model';
-import { OpenAIEmbeddingService } from '../../../integrations/src/openai/embeddings.service';
+import { GeminiEmbeddingService } from '../../../integrations/src/gemini';
 
 export interface SearchResult {
   id: string;
@@ -28,7 +28,7 @@ export interface SearchOptions {
 
 export class VectorSearchService {
   constructor(
-    private embeddingService: OpenAIEmbeddingService
+    private embeddingService: GeminiEmbeddingService
   ) {}
 
   /**
@@ -56,7 +56,7 @@ export class VectorSearchService {
           path: 'chunks.embedding',
           queryVector: queryEmbedding,
           numCandidates: topK * 10,
-          limit: topK
+          limit: topK * 3
         }
       },
       // Unwind chunks để có thể filter
@@ -114,16 +114,16 @@ export class VectorSearchService {
   ): Promise<SearchResult[]> {
     const { topK = 5 } = options;
 
-    // 1. Vector search
-    const vectorResults = await this.search(query, { 
-      ...options, 
-      topK: Math.ceil(topK * 1.5) 
-    });
+    // Run both searches in parallel
+    const [vectorResults, keywordResults] = await Promise.all([
+      this.search(query, { 
+        ...options, 
+        topK: Math.ceil(topK * 1.5) 
+      }),
+      this.keywordSearch(query, options)
+    ]);
 
-    // 2. Keyword search (MongoDB text search)
-    const keywordResults = await this.keywordSearch(query, options);
-
-    // 3. Merge và re-rank results
+    // Merge và re-rank results
     return this.mergeAndRerankResults(
       vectorResults, 
       keywordResults, 
@@ -198,13 +198,14 @@ export class VectorSearchService {
     const k = 60; // RRF constant
     const scoreMap = new Map<string, { result: SearchResult; rrfScore: number }>();
 
-    // Calculate RRF scores
+    // Calculate RRF scores for vector results
     vectorResults.forEach((result, rank) => {
       const id = result.id.toString();
       const rrfScore = 1 / (k + rank + 1);
       scoreMap.set(id, { result, rrfScore });
     });
 
+    // Add RRF scores for keyword results
     keywordResults.forEach((result, rank) => {
       const id = result.id.toString();
       const rrfScore = 1 / (k + rank + 1);
@@ -254,5 +255,59 @@ export class VectorSearchService {
     }
 
     return stages;
+  }
+
+  /**
+   * Get similar findings by embedding
+   */
+  async findSimilar(
+    findingId: number,
+    topK: number = 5
+  ): Promise<SearchResult[]> {
+    const finding = await AuditFinding.findOne({ id: findingId });
+    
+    if (!finding || !finding.embedding) {
+      throw new Error('Finding not found or not indexed');
+    }
+
+    const pipeline: any[] = [
+      {
+        $vectorSearch: {
+          index: 'audit_findings_vector_index',
+          path: 'embedding',
+          queryVector: finding.embedding,
+          numCandidates: topK * 10,
+          limit: topK + 1 // +1 to exclude self
+        }
+      },
+      {
+        $match: {
+          id: { $ne: findingId } // Exclude the source finding
+        }
+      },
+      {
+        $addFields: {
+          score: { $meta: 'vectorSearchScore' }
+        }
+      },
+      {
+        $project: {
+          id: '$_id',
+          text: '$summary',
+          score: 1,
+          metadata: {
+            protocol: '$protocol_name',
+            impact: '$impact',
+            title: '$title',
+            section: 'summary',
+            source_link: '$source_link',
+            firm: '$firm_name'
+          }
+        }
+      },
+      { $limit: topK }
+    ];
+
+    return await AuditFinding.aggregate(pipeline);
   }
 }
