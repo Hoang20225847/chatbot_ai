@@ -1,0 +1,76 @@
+services:
+  client:
+    build:
+      context: .
+      dockerfile: ./client/Dockerfile
+      target: dependencies # For development, use the dependencies stage
+      args:
+        NODE_ENV: development
+        CLIENT_PORT: 8080
+    volumes:
+      - ./client:/usr/src/app/client
+      - /usr/src/app/node_modules
+      - /usr/src/app/dist
+    ports:
+      - 8080:8080
+    environment:
+      NODE_ENV: development
+      CLIENT_PORT: 8080
+      CDN_URL: http://localhost:8080/
+    command: npm run dev:client
+
+  server:
+    build:
+      context: .
+      dockerfile: ./server/Dockerfile
+      target: dependencies # For development, use the dependencies stage
+      args:
+        NODE_ENV: development
+        PORT: 3000
+    volumes:
+      - ./:/usr/src/app
+      - /usr/src/app/node_modules
+      - /usr/src/app/dist
+    ports:
+      - 3000:3000
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      MONGODB_URI: mongodb://data:27017/chatbotdb
+      REDIS_URI: redis://cache:6379
+      CLIENT_MANIFEST_URL: http://client:8080/manifest.json # use container name to be accessible from another container
+      FAVICON_URL: http://localhost:8080/favicon.ico
+      COOKIE_SECRET: my-cookie-secret
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    depends_on:
+      client:
+        condition: service_started
+      data:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    command: npm run dev:server
+
+  data:
+    image: mongo:latest
+    volumes:
+      - ./data/mongodb_data:/data/db
+    ports:
+      - 27017:27017
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+
+  cache:
+    image: redis:latest
+    volumes:
+      - ./cache/redis_data:/data
+    ports:
+      - 6379:6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 3

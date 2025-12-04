@@ -1,0 +1,48 @@
+services:
+  # Web service for the client (Static Site)
+  - type: web
+    name: chatbot-client
+    runtime: static
+    buildCommand: npm ci --include=dev && npm run build:client
+    staticPublishPath: ./dist
+    buildFilter:
+      paths: # Only trigger a build with changes to these files
+        - client/**/*
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+  - type: web
+    name: chatbot-server
+    plan: free
+    runtime: docker
+    dockerfilePath: ./server/Dockerfile
+    buildFilter:
+      ignoredPaths:
+        - client/**/*
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 80
+      - key: REDIS_URI
+        fromService:
+          type: redis
+          name: chatbot-cache
+          property: connectionString
+      - key: MONGODB_URI
+        sync: false # get value from dashboard
+      - key: CLIENT_MANIFEST_URL
+        value: https://chatbot-client-q9me.onrender.com/manifest.json
+      - key: FAVICON_URL
+        value: https://chatbot-client-q9me.onrender.com/favicon.ico
+      - key: COOKIE_SECRET
+        sync: false # get value from dashboard
+      - key: GEMINI_API_KEY
+        sync: false # get value from dashboard
+
+  - type: redis
+    name: chatbot-cache
+    plan: free
+    ipAllowList: [] # Only allow internal connections
